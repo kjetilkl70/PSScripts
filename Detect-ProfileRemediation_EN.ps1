@@ -21,8 +21,9 @@
 .NOTES
     Forfatter:  Kjetil Klonteig
     Firma:      Sopra Steria
-    Versjon:    4.2.8
+    Version:    4.3.0
     Changelog:
+        4.3.0 - Version bump for ACL update step in Engine.
         4.2.8 - Version bump for English translation.
         4.2.7 - Version bump for ASCII-fix, versjonsjekk og
                  konfigurerbare overlay-tekster.
@@ -39,7 +40,7 @@
 #>
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = "4.2.8"
+$ScriptVersion = "4.3.0"
 
 # ============================================================
 # Konfigurasjon

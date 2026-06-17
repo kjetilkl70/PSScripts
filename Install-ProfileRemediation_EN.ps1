@@ -20,7 +20,7 @@
     Task 2: "ProfileRemediation-Engine" (SYSTEM, 5s delay)
         - Reads request file written by Overlay (no user guessing)
         - Validates duplicate pattern in ProfileList registry
-        - Backup -> ProfileList remap -> delete .AD profile -> DONE signal
+        - Backup -> ProfileList remap -> delete .AD profile -> update ACLs -> DONE signal
         - Per-user completion marker prevents repeated execution
 
     Idempotent: Safe to run multiple times - files and tasks are overwritten.
@@ -29,8 +29,13 @@
 .NOTES
     Author:  Kjetil Klonteig
     Company:      Sopra Steria
-    Version:    4.2.8
+    Version:    4.3.0
     Changelog:
+        4.3.0 - Added Step 5 to Engine: updates NTFS ownership and
+                 permissions on the original profile folder after registry
+                 remap. Ensures new SID has Full Control and ownership,
+                 removes old SID from ACLs. Fixes gpsvc access denied
+                 errors on machines without sIDHistory resolution.
         4.2.8 - All text, comments, log messages, and instructions
                  translated to English.
         4.2.7 - All Norwegian characters in Install script replaced with ASCII.
@@ -72,7 +77,7 @@
 #>
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = "4.2.8"
+$ScriptVersion = "4.3.0"
 
 # ============================================================
 # Configuration
@@ -641,55 +646,81 @@ try {
     Write-EngineLog "========================================="
 
     # ---- Step 1: Backup old ProfileList key ----
-    Write-EngineLog "Step 1/4: Exporting registry backup"
+    Write-EngineLog "Step 1/5: Exporting registry backup"
     if (-not (Test-Path $BackupDir)) {
         New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
     }
     $Timestamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
     $BackupFile = Join-Path $BackupDir "$env:COMPUTERNAME-$SamAccount-$Timestamp.reg"
     $RegExport = & reg.exe export "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$OldSid" $BackupFile /y 2>&1
-    Write-EngineLog "Step 1/4: Backup saved: $BackupFile (reg.exe output: $RegExport)"
+    Write-EngineLog "Step 1/5: Backup saved: $BackupFile (reg.exe output: $RegExport)"
 
     # ---- Step 2: Delete new SID key (points to .AD) ----
-    Write-EngineLog "Step 2/4: Removing new SID key ($CurrentSid)"
+    Write-EngineLog "Step 2/5: Removing new SID key ($CurrentSid)"
     $NewSidKeyPath = "$ProfileListReg\$CurrentSid"
     if (Test-Path $NewSidKeyPath) {
         Remove-Item $NewSidKeyPath -Recurse -Force
-        Write-EngineLog "Step 2/4: Removed $NewSidKeyPath (pointed to $UserProfileDuped)"
+        Write-EngineLog "Step 2/5: Removed $NewSidKeyPath (pointed to $UserProfileDuped)"
     }
     else {
         Write-EngineLog "Steg 2/4: $NewSidKeyPath did not exist - continuing"
     }
 
     # ---- Step 3: Copy old SID to new SID, delete old ----
-    Write-EngineLog "Step 3/4: Copying $OldSid -> $CurrentSid"
+    Write-EngineLog "Step 3/5: Copying $OldSid -> $CurrentSid"
     Copy-Item $OldSidEntry.PSPath "$ProfileListReg\$CurrentSid" -Recurse
-    Write-EngineLog "Step 3/4: Copy complete, deleting old key $OldSid"
+    Write-EngineLog "Step 3/5: Copy complete, deleting old key $OldSid"
     Remove-Item $OldSidEntry.PSPath -Recurse -Force
-    Write-EngineLog "Step 3/4: ProfileList remapped: $OldSid -> $CurrentSid"
+    Write-EngineLog "Step 3/5: ProfileList remapped: $OldSid -> $CurrentSid"
 
     # Verify remapping
     $VerifyPath = (Get-ItemProperty "$ProfileListReg\$CurrentSid" -ErrorAction SilentlyContinue).ProfileImagePath
-    Write-EngineLog "Step 3/4: Verification: $CurrentSid now points to '$VerifyPath'"
+    Write-EngineLog "Step 3/5: Verification: $CurrentSid now points to '$VerifyPath'"
 
     # ---- Step 4: Remove duplicate profile folder ----
-    Write-EngineLog "Step 4/4: Removing duplicate profile $UserProfileDuped"
+    Write-EngineLog "Step 4/5: Removing duplicate profile $UserProfileDuped"
     $EscapedPath  = $UserProfileDuped -replace '\\', '\\\\'
     $DupedProfile = Get-CimInstance Win32_UserProfile -Filter "LocalPath='$EscapedPath'" -ErrorAction SilentlyContinue
 
     if ($DupedProfile) {
-        Write-EngineLog "Step 4/4: Found Win32_UserProfile for $UserProfileDuped - removing via CIM"
+        Write-EngineLog "Step 4/5: Found Win32_UserProfile for $UserProfileDuped - removing via CIM"
         Remove-CimInstance -InputObject $DupedProfile -ErrorAction SilentlyContinue
-        Write-EngineLog "Step 4/4: Win32_UserProfile removed"
+        Write-EngineLog "Step 4/5: Win32_UserProfile removed"
     }
     elseif (Test-Path $UserProfileDuped) {
-        Write-EngineLog "Step 4/4: No Win32_UserProfile found - removing folder directly"
+        Write-EngineLog "Step 4/5: No Win32_UserProfile found - removing folder directly"
         Remove-Item $UserProfileDuped -Recurse -Force -ErrorAction SilentlyContinue
-        Write-EngineLog "Step 4/4: Folder removed"
+        Write-EngineLog "Step 4/5: Folder removed"
     }
     else {
-        Write-EngineLog "Step 4/4: Duplicate folder already gone"
+        Write-EngineLog "Step 4/5: Duplicate folder already gone"
     }
+
+    # ---- Step 5: Update NTFS ACLs on original profile folder ----
+    Write-EngineLog "Step 5/5: Updating NTFS permissions on $UserProfileBase"
+    Write-EngineLog "Step 5/5: Taking ownership for $CurrentSid ($SamAccount)"
+
+    # Take ownership of the entire profile tree
+    $TakeownResult = & takeown.exe /F $UserProfileBase /R /A /D Y 2>&1
+    $TakeownLast = ($TakeownResult | Select-Object -Last 1) -as [string]
+    Write-EngineLog "Step 5/5: takeown completed: $TakeownLast"
+
+    # Grant Full Control to the new SID (recursive, applies to this folder, subfolders, and files)
+    $IcaclsGrant = & icacls.exe $UserProfileBase /grant "*${CurrentSid}:(OI)(CI)F" /T /C /Q 2>&1
+    $IcaclsLast = ($IcaclsGrant | Select-Object -Last 1) -as [string]
+    Write-EngineLog "Step 5/5: icacls grant completed: $IcaclsLast"
+
+    # Set the new SID as owner (takeown /A sets Administrators, this sets the actual user)
+    $IcaclsOwner = & icacls.exe $UserProfileBase /setowner "*$CurrentSid" /T /C /Q 2>&1
+    $IcaclsOwnerLast = ($IcaclsOwner | Select-Object -Last 1) -as [string]
+    Write-EngineLog "Step 5/5: icacls setowner completed: $IcaclsOwnerLast"
+
+    # Remove the old SID from ACLs (cleanup, non-critical)
+    $IcaclsRemove = & icacls.exe $UserProfileBase /remove "*$OldSid" /T /C /Q 2>&1
+    $IcaclsRemoveLast = ($IcaclsRemove | Select-Object -Last 1) -as [string]
+    Write-EngineLog "Step 5/5: icacls remove old SID completed: $IcaclsRemoveLast"
+
+    Write-EngineLog "Step 5/5: NTFS permissions updated for $SamAccount on $UserProfileBase"
 
     # ---- Telemetry and markers ----
     Write-EngineLog "Writing telemetry and markers"
